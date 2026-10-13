@@ -160,17 +160,18 @@ const pack=(r,g,b)=>(255<<24)|((b&255)<<16)|((g&255)<<8)|(r&255);
 const view=document.getElementById('view');
 const vctx=view.getContext('2d',{alpha:false});
 let W=0,H=0,img=null,buf=null;      // render buffer (low-res, scaled up by CSS)
-const RENDER_W=440;                  // horizontal render resolution
-let zbuf=null, wallBottom=null, wallTop=null;
+let RENDER_W=440;                    // horizontal render resolution (adaptive)
+let zbuf=null, wallBottom=null, wallTop=null, dbuf=null;   // dbuf: inverse depth
 
 function resize(){
-  const dw=window.innerWidth, dh=window.innerHeight;
+  const dh=window.innerHeight, dw=window.innerWidth;
   const aspect=dh/dw;
   W=RENDER_W; H=Math.max(140,Math.round(W*aspect));
   view.width=W; view.height=H;
   img=vctx.createImageData(W,H);
   buf=new Uint32Array(img.data.buffer);
   zbuf=new Float32Array(W); wallBottom=new Int32Array(W); wallTop=new Int32Array(W);
+  dbuf=new Float32Array(W*H);
   vctx.imageSmoothingEnabled=false;
 }
 window.addEventListener('resize',resize); resize();
@@ -397,19 +398,43 @@ function lightAt(x,y){                       // bilinear sample of the bake
   return lerp(lerp(a,b,tx),lerp(c,d,tx),ty);
 }
 
-/* ------------------------------ audio -------------------------------- */
-let AC=null, master=null, convNoise=null;
+/* ------------------------------ audio --------------------------------
+   Everything is synthesised, but run warm: a convolution tail from a
+   generated stone-cistern impulse, a shelf that takes the fizz off the
+   top, and a compressor so it sits together instead of spiking.     */
+let AC=null, master=null, verb=null, verbSend=null, dry=null;
 function initAudio(){
   if(AC)return;
   AC=new (window.AudioContext||window.webkitAudioContext)();
-  master=AC.createGain(); master.gain.value=.55; master.connect(AC.destination);
-  // a little room: short feedback delay instead of a reverb impulse
-  const dl=AC.createDelay(.5); dl.delayTime.value=.13;
-  const fb=AC.createGain(); fb.gain.value=.34;
-  const wet=AC.createGain(); wet.gain.value=.3;
-  const lp=AC.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=1800;
-  dl.connect(fb); fb.connect(lp); lp.connect(dl); dl.connect(wet); wet.connect(master);
-  convNoise=dl;
+  master=AC.createGain(); master.gain.value=.5;
+  const warm=AC.createBiquadFilter(); warm.type='highshelf';
+  warm.frequency.value=3200; warm.gain.value=-9;          // take the tin off
+  const body=AC.createBiquadFilter(); body.type='lowshelf';
+  body.frequency.value=220; body.gain.value=5;            // put some chest back
+  const roll=AC.createBiquadFilter(); roll.type='lowpass';
+  roll.frequency.value=8200; roll.Q.value=.5;
+  const comp=AC.createDynamicsCompressor();
+  comp.threshold.value=-20; comp.knee.value=28; comp.ratio.value=3.4;
+  comp.attack.value=.006; comp.release.value=.22;
+  master.connect(warm); warm.connect(body); body.connect(roll);
+  roll.connect(comp); comp.connect(AC.destination);
+
+  // a wet stone room: exponentially decaying, low-passed noise impulse
+  const dur=2.6, n=(AC.sampleRate*dur)|0, ir=AC.createBuffer(2,n,AC.sampleRate);
+  for(let ch=0;ch<2;ch++){
+    const d=ir.getChannelData(ch); let lp=0;
+    for(let i=0;i<n;i++){
+      const t=i/n;
+      const e=Math.pow(1-t,2.6)*(1-Math.exp(-i/320));     // slow build, long tail
+      lp+= ((Math.random()*2-1)-lp)*0.16;                 // one-pole lowpass
+      d[i]=lp*e*(ch?0.92:1);
+    }
+  }
+  verb=AC.createConvolver(); verb.buffer=ir;
+  const verbLow=AC.createBiquadFilter(); verbLow.type='lowpass'; verbLow.frequency.value=2600;
+  const verbGain=AC.createGain(); verbGain.gain.value=.5;
+  verbSend=AC.createGain(); verbSend.gain.value=1;
+  verbSend.connect(verbLow); verbLow.connect(verb); verb.connect(verbGain); verbGain.connect(master);
   ambient();
 }
 function noiseBuf(dur){
@@ -417,258 +442,524 @@ function noiseBuf(dur){
   for(let i=0;i<n;i++)d[i]=Math.random()*2-1;
   return b;
 }
+// brown-ish noise: far less hissy than white
+function brownBuf(dur){
+  const n=(AC.sampleRate*dur)|0, b=AC.createBuffer(1,n,AC.sampleRate), d=b.getChannelData(0);
+  let v=0;
+  for(let i=0;i<n;i++){ v=(v+(Math.random()*2-1)*.09); v*=.985; d[i]=clamp(v*3.2,-1,1); }
+  return b;
+}
 function env(g,t,a,d,peak){
   g.gain.cancelScheduledValues(t); g.gain.setValueAtTime(0.0001,t);
   g.gain.exponentialRampToValueAtTime(peak,t+a);
   g.gain.exponentialRampToValueAtTime(0.0001,t+a+d);
 }
-// pan/volume by world position relative to the player
-function place(node,x,y,vol){
-  const dx=x-player.x, dy=y-player.y, d=Math.hypot(dx,dy);
-  const g=AC.createGain(); g.gain.value=(vol||1)/(1+d*d*.1);
-  node.connect(g); g.connect(convNoise);
-  if(AC.createStereoPanner){
-    const p=AC.createStereoPanner();
-    const fwd=dx*player.dirX+dy*player.dirY, rgt=dx*player.plX+dy*player.plY;
-    p.pan.value=clamp(rgt/Math.max(.6,Math.hypot(fwd,rgt)),-1,1);
-    g.connect(p); p.connect(master);
-  }else g.connect(master);
+function out(node,vol,send){                              // dry + reverb send
+  const g=AC.createGain(); g.gain.value=vol===undefined?1:vol;
+  node.connect(g); g.connect(master);
+  if(verbSend){ const w=AC.createGain(); w.gain.value=(send===undefined?.35:send)*g.gain.value;
+    node.connect(w); w.connect(verbSend); }
+  return g;
+}
+/* ---- true directional placement -------------------------------------
+   Sources are positioned in 3D and panned through an HRTF panner, with
+   the listener kept on the player's head and facing, so you can tell
+   left from right, in front from behind, and above from below. Sound
+   with a wall in the way loses its gain and most of its top end.    */
+function setPos(n,x,y,z){
+  if(n.positionX){ n.positionX.value=x; n.positionY.value=y; n.positionZ.value=z; }
+  else if(n.setPosition) n.setPosition(x,y,z);
+}
+function updateListener(){
+  if(!AC)return;
+  const L=AC.listener, ez=player.eyeZ();
+  if(L.positionX){
+    L.positionX.value=player.x; L.positionY.value=ez; L.positionZ.value=player.y;
+    L.forwardX.value=player.dirX; L.forwardY.value=0; L.forwardZ.value=player.dirY;
+    L.upX.value=0; L.upY.value=1; L.upZ.value=0;
+  }else if(L.setPosition){
+    L.setPosition(player.x,ez,player.y);
+    L.setOrientation(player.dirX,0,player.dirY,0,1,0);
+  }
+}
+// world (x,y) maps to audio (x, height, y); audio's right-hand rule then
+// puts the listener's right exactly where the camera plane does.
+function place(node,x,y,vol,send,h){
+  const z=(h===undefined)?0.3:h;
+  const d=Math.hypot(x-player.x,y-player.y);
+  const blocked=!losClear(player.x,player.y,x,y);
+  const g=AC.createGain(); g.gain.value=(vol||1)*(blocked?.42:1);
+  const f=AC.createBiquadFilter(); f.type='lowpass';
+  f.frequency.value=blocked?clamp(760-d*40,200,760):clamp(8000-d*430,900,8000);
+  node.connect(g); g.connect(f);
+  let tail=f;
+  if(AC.createPanner){
+    const p=AC.createPanner();
+    try{ p.panningModel='HRTF'; }catch(err){ p.panningModel='equalpower'; }
+    p.distanceModel='inverse'; p.refDistance=1.5; p.rolloffFactor=1.6; p.maxDistance=45;
+    setPos(p,x,z,y);
+    f.connect(p); p.connect(master); tail=p;
+  }else f.connect(master);
+  if(verbSend){                      // more room, the further off and the more hidden
+    const w=AC.createGain();
+    w.gain.value=g.gain.value*(send===undefined?.5:send)*(blocked?1.5:1)*clamp(.5+d*.09,.5,1.6);
+    tail.connect(w); w.connect(verbSend);
+  }
   return g;
 }
 function sGun(){
   if(!AC)return; const t=AC.currentTime;
-  const s=AC.createBufferSource(); s.buffer=noiseBuf(.3);
-  const f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=950; f.Q.value=.7;
-  const g=AC.createGain(); env(g,t,.002,.26,.9);
-  s.connect(f); f.connect(g); g.connect(master); g.connect(convNoise); s.start(t); s.stop(t+.35);
-  const o=AC.createOscillator(); o.type='triangle'; o.frequency.setValueAtTime(180,t);
-  o.frequency.exponentialRampToValueAtTime(42,t+.14);
-  const og=AC.createGain(); env(og,t,.003,.14,.8);
-  o.connect(og); og.connect(master); o.start(t); o.stop(t+.2);
+  // 1: the thump that makes it a gun and not a hiss
+  const o=AC.createOscillator(); o.type='sine';
+  o.frequency.setValueAtTime(130,t); o.frequency.exponentialRampToValueAtTime(34,t+.22);
+  const og=AC.createGain(); env(og,t,.004,.34,1.0); o.connect(og); out(og,.95,.3);
+  o.start(t);o.stop(t+.5);
+  // 2: body — brown noise through a falling lowpass
+  const s=AC.createBufferSource(); s.buffer=brownBuf(.5);
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.Q.value=1.1;
+  f.frequency.setValueAtTime(2200,t); f.frequency.exponentialRampToValueAtTime(260,t+.3);
+  const g=AC.createGain(); env(g,t,.003,.36,.85);
+  s.connect(f); f.connect(g); out(g,1,.55); s.start(t); s.stop(t+.55);
+  // 3: a short crack, kept quiet so it never gets shrill
+  const c=AC.createBufferSource(); c.buffer=noiseBuf(.08);
+  const cf=AC.createBiquadFilter(); cf.type='bandpass'; cf.frequency.value=1700; cf.Q.value=.8;
+  const cg=AC.createGain(); env(cg,t,.001,.06,.3);
+  c.connect(cf); cf.connect(cg); out(cg,1,.4); c.start(t); c.stop(t+.1);
 }
 function sDry(){ if(!AC)return; const t=AC.currentTime;
-  const s=AC.createBufferSource(); s.buffer=noiseBuf(.05);
-  const f=AC.createBiquadFilter(); f.type='highpass'; f.frequency.value=2600;
-  const g=AC.createGain(); env(g,t,.001,.04,.25);
-  s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+.06);}
+  const s=AC.createBufferSource(); s.buffer=noiseBuf(.06);
+  const f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=1100; f.Q.value=1.4;
+  const g=AC.createGain(); env(g,t,.001,.05,.3);
+  s.connect(f);f.connect(g);out(g,1,.3);s.start(t);s.stop(t+.08);}
 function sReload(d){ if(!AC)return; const t=AC.currentTime+(d||0);
-  const s=AC.createBufferSource(); s.buffer=noiseBuf(.08);
-  const f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=1900+rnd(-400,400);f.Q.value=2;
-  const g=AC.createGain(); env(g,t,.002,.07,.3);
-  s.connect(f);f.connect(g);g.connect(master);g.connect(convNoise);s.start(t);s.stop(t+.1);}
-function sStep(water){ if(!AC)return; const t=AC.currentTime;
-  const s=AC.createBufferSource(); s.buffer=noiseBuf(.16);
-  const f=AC.createBiquadFilter();
-  if(water){f.type='bandpass';f.frequency.value=1400;f.Q.value=.6;}
-  else{f.type='lowpass';f.frequency.value=520;}
-  const g=AC.createGain(); env(g,t,.004,water?.14:.07,water?.3:.18);
-  s.connect(f);f.connect(g);g.connect(master);g.connect(convNoise);s.start(t);s.stop(t+.2);}
+  const s=AC.createBufferSource(); s.buffer=noiseBuf(.09);
+  const f=AC.createBiquadFilter(); f.type='bandpass';
+  f.frequency.value=780+rnd(-160,160); f.Q.value=1.6;
+  const g=AC.createGain(); env(g,t,.002,.08,.35);
+  s.connect(f);f.connect(g);out(g,1,.4);s.start(t);s.stop(t+.12);
+  const o=AC.createOscillator(); o.type='triangle';       // the clunk of iron on iron
+  o.frequency.setValueAtTime(220,t); o.frequency.exponentialRampToValueAtTime(90,t+.07);
+  const og=AC.createGain(); env(og,t,.002,.07,.35);
+  o.connect(og); out(og,1,.35); o.start(t); o.stop(t+.12);}
+/* Your own boots, scaled by exactly the noise value the vermin hear on.
+   A crouch is a scuff you can barely make out; a run slaps the brick and
+   rings the whole cistern — if you can hear the room answer, so can they. */
+function sStep(water,loud){
+  if(!AC)return; const t=AC.currentTime;
+  const k=clamp(loud===undefined?.45:loud,0,1);
+  const s=AC.createBufferSource(); s.buffer=brownBuf(.24);
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.Q.value=.9;
+  f.frequency.value=(water?620:300)+k*(water?1500:1250);
+  const g=AC.createGain(); env(g,t,.005,.09+k*.1,.10+k*.42);
+  s.connect(f);f.connect(g);out(g,1,.14+k*.75);s.start(t);s.stop(t+.3);
+  if(k>.42){                                   // heel strike: the part that carries
+    const o=AC.createOscillator(); o.type='sine';
+    o.frequency.setValueAtTime(150,t); o.frequency.exponentialRampToValueAtTime(58,t+.09);
+    const og=AC.createGain(); env(og,t,.003,.1,(k-.4)*.5);
+    o.connect(og); out(og,1,.5+k*.5); o.start(t); o.stop(t+.2);
+  }
+  if(water){
+    const w=AC.createBufferSource(); w.buffer=noiseBuf(.18);
+    const wf=AC.createBiquadFilter(); wf.type='bandpass';
+    wf.frequency.value=900+k*1100; wf.Q.value=.6;
+    const wg=AC.createGain(); env(wg,t,.004,.1+k*.1,.08+k*.3);
+    w.connect(wf);wf.connect(wg);out(wg,1,.4+k*.6);w.start(t);w.stop(t+.25);
+  }
+}
+function sLand(loud,water){
+  if(!AC)return; const t=AC.currentTime; const k=clamp(loud,0,1);
+  const o=AC.createOscillator(); o.type='sine';
+  o.frequency.setValueAtTime(120,t); o.frequency.exponentialRampToValueAtTime(42,t+.16);
+  const g=AC.createGain(); env(g,t,.004,.18,.3+k*.5); o.connect(g); out(g,1,.4+k*.6);
+  o.start(t);o.stop(t+.3);
+  sStep(water,Math.max(.55,k));
+}
+function sSlide(water){
+  if(!AC)return; const t=AC.currentTime;
+  const n=AC.createBufferSource(); n.buffer=brownBuf(.8);
+  const f=AC.createBiquadFilter(); f.type='bandpass'; f.Q.value=.8;
+  f.frequency.setValueAtTime(water?1100:700,t);
+  f.frequency.exponentialRampToValueAtTime(water?380:240,t+.6);
+  const g=AC.createGain();
+  g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(.42,t+.05);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+.62);
+  n.connect(f);f.connect(g);out(g,1,.8);n.start(t);n.stop(t+.7);
+}
+// a low throaty yap, not a beep: two detuned saws under a resonant lowpass
 function sBark(x,y){ if(!AC)return; const t=AC.currentTime;
-  // metallic yap: two detuned saws through a swept bandpass, plus a noise rasp
   const o1=AC.createOscillator(),o2=AC.createOscillator();
-  o1.type='sawtooth';o2.type='square';
-  o1.frequency.setValueAtTime(420,t); o1.frequency.exponentialRampToValueAtTime(150,t+.12);
-  o2.frequency.setValueAtTime(633,t); o2.frequency.exponentialRampToValueAtTime(190,t+.12);
-  const f=AC.createBiquadFilter(); f.type='bandpass'; f.Q.value=5;
-  f.frequency.setValueAtTime(1500,t); f.frequency.exponentialRampToValueAtTime(600,t+.13);
-  const g=AC.createGain(); env(g,t,.004,.12,.5);
-  o1.connect(f);o2.connect(f);f.connect(g); place(g,x,y,1.1);
-  o1.start(t);o2.start(t);o1.stop(t+.2);o2.stop(t+.2);
-  const n=AC.createBufferSource(); n.buffer=noiseBuf(.1);
-  const nf=AC.createBiquadFilter(); nf.type='highpass'; nf.frequency.value=2200;
-  const ng=AC.createGain(); env(ng,t,.003,.08,.22);
-  n.connect(nf);nf.connect(ng); place(ng,x,y,1); n.start(t);n.stop(t+.12);}
-function sBite(x,y){ if(!AC)return; const t=AC.currentTime;
-  const n=AC.createBufferSource(); n.buffer=noiseBuf(.12);
-  const f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.setValueAtTime(3000,t);
-  f.frequency.exponentialRampToValueAtTime(700,t+.08); f.Q.value=3;
-  const g=AC.createGain(); env(g,t,.002,.09,.6);
-  n.connect(f);f.connect(g); place(g,x,y,1.2); n.start(t);n.stop(t+.14);
-  const o=AC.createOscillator(); o.type='square'; o.frequency.setValueAtTime(900,t);
-  o.frequency.exponentialRampToValueAtTime(260,t+.05);
-  const og=AC.createGain(); env(og,t,.002,.05,.3);
-  o.connect(og); place(og,x,y,1); o.start(t);o.stop(t+.08);}
-function sHurt(){ if(!AC)return; const t=AC.currentTime;
-  const o=AC.createOscillator(); o.type='sine'; o.frequency.setValueAtTime(220,t);
-  o.frequency.exponentialRampToValueAtTime(70,t+.3);
-  const g=AC.createGain(); env(g,t,.005,.3,.5);
-  o.connect(g);g.connect(master);o.start(t);o.stop(t+.4);}
-function sDie(x,y){ if(!AC)return; const t=AC.currentTime;
+  o1.type='sawtooth';o2.type='sawtooth';
+  o1.frequency.setValueAtTime(196,t); o1.frequency.exponentialRampToValueAtTime(96,t+.16);
+  o2.frequency.setValueAtTime(203,t); o2.frequency.exponentialRampToValueAtTime(99,t+.16);
+  const lp=AC.createBiquadFilter(); lp.type='lowpass'; lp.Q.value=7;
+  lp.frequency.setValueAtTime(1250,t); lp.frequency.exponentialRampToValueAtTime(330,t+.17);
+  const fm=AC.createBiquadFilter(); fm.type='peaking';     // a throat formant
+  fm.frequency.value=620; fm.Q.value=1.4; fm.gain.value=7;
+  const g=AC.createGain(); env(g,t,.012,.16,.55);
+  o1.connect(lp);o2.connect(lp);lp.connect(fm);fm.connect(g);
+  place(g,x,y,1,.55);
+  o1.start(t);o2.start(t);o1.stop(t+.3);o2.stop(t+.3);
+  const n=AC.createBufferSource(); n.buffer=brownBuf(.14); // servo rasp underneath
+  const nf=AC.createBiquadFilter(); nf.type='bandpass'; nf.frequency.value=520; nf.Q.value=1.1;
+  const ng=AC.createGain(); env(ng,t,.006,.12,.3);
+  n.connect(nf);nf.connect(ng); place(ng,x,y,.9,.5); n.start(t);n.stop(t+.18);}
+// the winding-up shriek before a dash
+function sScreech(x,y){ if(!AC)return; const t=AC.currentTime;
   const o=AC.createOscillator(); o.type='sawtooth';
-  o.frequency.setValueAtTime(520,t); o.frequency.exponentialRampToValueAtTime(30,t+.5);
-  const f=AC.createBiquadFilter(); f.type='lowpass'; f.frequency.setValueAtTime(2400,t);
-  f.frequency.exponentialRampToValueAtTime(260,t+.5);
-  const g=AC.createGain(); env(g,t,.004,.5,.45);
-  o.connect(f);f.connect(g); place(g,x,y,1.1); o.start(t);o.stop(t+.6);
-  const n=AC.createBufferSource(); n.buffer=noiseBuf(.5);
-  const nf=AC.createBiquadFilter(); nf.type='bandpass'; nf.frequency.value=2600;nf.Q.value=1.2;
-  const ng=AC.createGain(); env(ng,t+.03,.01,.35,.3);
-  n.connect(nf);nf.connect(ng); place(ng,x,y,1); n.start(t);n.stop(t+.6);}
+  o.frequency.setValueAtTime(150,t); o.frequency.exponentialRampToValueAtTime(430,t+.3);
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.Q.value=9;
+  f.frequency.setValueAtTime(600,t); f.frequency.exponentialRampToValueAtTime(1900,t+.3);
+  const g=AC.createGain(); env(g,t,.05,.3,.4);
+  o.connect(f);f.connect(g); place(g,x,y,1,.7); o.start(t);o.stop(t+.45);
+  const n=AC.createBufferSource(); n.buffer=brownBuf(.3);  // claws scrabbling for grip
+  const nf=AC.createBiquadFilter(); nf.type='bandpass'; nf.frequency.value=900; nf.Q.value=.9;
+  const ng=AC.createGain(); env(ng,t,.02,.26,.2);
+  n.connect(nf);nf.connect(ng); place(ng,x,y,.9,.5); n.start(t);n.stop(t+.35);}
+function sBite(x,y){ if(!AC)return; const t=AC.currentTime;
+  const n=AC.createBufferSource(); n.buffer=brownBuf(.16);
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.Q.value=2;
+  f.frequency.setValueAtTime(1800,t); f.frequency.exponentialRampToValueAtTime(380,t+.1);
+  const g=AC.createGain(); env(g,t,.002,.11,.6);
+  n.connect(f);f.connect(g); place(g,x,y,1.1,.45); n.start(t);n.stop(t+.18);
+  const o=AC.createOscillator(); o.type='triangle';        // jaw plates meeting
+  o.frequency.setValueAtTime(420,t); o.frequency.exponentialRampToValueAtTime(110,t+.07);
+  const og=AC.createGain(); env(og,t,.002,.07,.45);
+  o.connect(og); place(og,x,y,1,.4); o.start(t);o.stop(t+.12);}
+function sHurt(){ if(!AC)return; const t=AC.currentTime;
+  const o=AC.createOscillator(); o.type='sine';
+  o.frequency.setValueAtTime(180,t); o.frequency.exponentialRampToValueAtTime(58,t+.35);
+  const g=AC.createGain(); env(g,t,.006,.35,.6);
+  o.connect(g);out(g,1,.3);o.start(t);o.stop(t+.5);
+  const n=AC.createBufferSource(); n.buffer=brownBuf(.3);
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=700;
+  const ng=AC.createGain(); env(ng,t,.004,.26,.3);
+  n.connect(f);f.connect(ng);out(ng,1,.35);n.start(t);n.stop(t+.35);}
+function sDie(x,y){ if(!AC)return; const t=AC.currentTime;
+  const o=AC.createOscillator(); o.type='sawtooth';        // the motor winding down
+  o.frequency.setValueAtTime(300,t); o.frequency.exponentialRampToValueAtTime(24,t+.7);
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.Q.value=3;
+  f.frequency.setValueAtTime(1500,t); f.frequency.exponentialRampToValueAtTime(180,t+.7);
+  const g=AC.createGain(); env(g,t,.006,.7,.5);
+  o.connect(f);f.connect(g); place(g,x,y,1.1,.7); o.start(t);o.stop(t+.9);
+  const n=AC.createBufferSource(); n.buffer=brownBuf(.6);  // the heap hitting the brick
+  const nf=AC.createBiquadFilter(); nf.type='lowpass'; nf.frequency.value=900;
+  const ng=AC.createGain(); env(ng,t+.05,.01,.4,.35);
+  n.connect(nf);nf.connect(ng); place(ng,x,y,1,.6); n.start(t);n.stop(t+.7);}
 function sLoot(){ if(!AC)return; const t=AC.currentTime;
-  [1046,1318,1568].forEach((fr,k)=>{const o=AC.createOscillator();o.type='sine';
-    o.frequency.value=fr; const g=AC.createGain(); env(g,t+k*.07,.01,.5,.22);
-    o.connect(g);g.connect(master);g.connect(convNoise);o.start(t+k*.07);o.stop(t+k*.07+.6);});}
+  [523,659,784].forEach((fr,k)=>{
+    const o=AC.createOscillator();o.type='triangle';o.frequency.value=fr;
+    const o2=AC.createOscillator();o2.type='sine';o2.frequency.value=fr*2;
+    const g=AC.createGain(); env(g,t+k*.09,.02,.9,.2);
+    const g2=AC.createGain(); g2.gain.value=.35; o2.connect(g2); g2.connect(g);
+    o.connect(g);out(g,1,.8);
+    o.start(t+k*.09);o.stop(t+k*.09+1);o2.start(t+k*.09);o2.stop(t+k*.09+1);});}
 function sSpark(x,y){ if(!AC)return; const t=AC.currentTime;
-  const n=AC.createBufferSource(); n.buffer=noiseBuf(.08);
-  const f=AC.createBiquadFilter(); f.type='highpass'; f.frequency.value=3400;
-  const g=AC.createGain(); env(g,t,.001,.07,.3);
-  n.connect(f);f.connect(g); place(g,x,y,.8); n.start(t);n.stop(t+.1);}
+  const n=AC.createBufferSource(); n.buffer=noiseBuf(.1);
+  const f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=1600; f.Q.value=1.2;
+  const g=AC.createGain(); env(g,t,.001,.09,.3);
+  n.connect(f);f.connect(g); place(g,x,y,.9,.5); n.start(t);n.stop(t+.14);
+  const o=AC.createOscillator(); o.type='triangle';
+  o.frequency.setValueAtTime(260,t); o.frequency.exponentialRampToValueAtTime(80,t+.08);
+  const og=AC.createGain(); env(og,t,.002,.08,.25);
+  o.connect(og); place(og,x,y,.8,.4); o.start(t);o.stop(t+.12);}
 function ambient(){
-  // room tone: filtered noise bed + a low drone
-  const n=AC.createBufferSource(); n.buffer=noiseBuf(4); n.loop=true;
-  const f=AC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=260;
-  const g=AC.createGain(); g.gain.value=.11; n.connect(f);f.connect(g);g.connect(master); n.start();
-  const o=AC.createOscillator(); o.type='sine'; o.frequency.value=47;
-  const og=AC.createGain(); og.gain.value=.1; o.connect(og);og.connect(master); o.start();
-  const o2=AC.createOscillator(); o2.type='sine'; o2.frequency.value=70.5;
-  const o2g=AC.createGain(); o2g.gain.value=.045; o2.connect(o2g);o2g.connect(master); o2.start();
+  // room tone: a brown-noise bed, a low drone and its fifth, all well under
+  const n=AC.createBufferSource(); n.buffer=brownBuf(6); n.loop=true;
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=190;
+  const g=AC.createGain(); g.gain.value=.3; n.connect(f);f.connect(g);g.connect(master); n.start();
+  const o=AC.createOscillator(); o.type='sine'; o.frequency.value=43.65;
+  const og=AC.createGain(); og.gain.value=.12; o.connect(og);og.connect(master); o.start();
+  const o2=AC.createOscillator(); o2.type='sine'; o2.frequency.value=65.4;
+  const o2g=AC.createGain(); o2g.gain.value=.05; o2.connect(o2g);o2g.connect(master); o2.start();
+  const lfo=AC.createOscillator(); lfo.type='sine'; lfo.frequency.value=.07;   // slow swell
+  const lg=AC.createGain(); lg.gain.value=.04; lfo.connect(lg); lg.connect(og.gain); lfo.start();
+  // far-off water moving through a pipe
+  const w=AC.createBufferSource(); w.buffer=brownBuf(5); w.loop=true;
+  const wf=AC.createBiquadFilter(); wf.type='bandpass'; wf.frequency.value=440; wf.Q.value=.7;
+  const wg=AC.createGain(); wg.gain.value=.07; w.connect(wf);wf.connect(wg);
+  wg.connect(master); if(verbSend)wg.connect(verbSend); w.start();
   drip();
 }
 function drip(){
   if(!AC)return;
   const t=AC.currentTime;
   const o=AC.createOscillator(); o.type='sine';
-  o.frequency.setValueAtTime(rnd(900,1700),t); o.frequency.exponentialRampToValueAtTime(rnd(180,420),t+.1);
-  const g=AC.createGain(); env(g,t,.003,.12,.3);
-  o.connect(g); g.connect(master); g.connect(convNoise); o.start(t);o.stop(t+.2);
-  setTimeout(drip,rnd(1400,5200));
+  o.frequency.setValueAtTime(rnd(600,1000),t);
+  o.frequency.exponentialRampToValueAtTime(rnd(140,260),t+.14);
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=2200;
+  const g=AC.createGain(); env(g,t,.004,.16,.22);
+  o.connect(f);f.connect(g); out(g,1,.9); o.start(t);o.stop(t+.3);
+  setTimeout(drip,rnd(1600,6000));
 }
 
-/* ---------------------------- sprite baking --------------------------
-   Everything that isn't a wall is a billboard baked from 2D drawing:
-   the robot terrapins, the reliquaries, the lamps, the wreckage.
-   Pixels drawn on the "glow" layer ignore the lightmap, so eyes and
-   flames stay visible in a pitch black corridor.                      */
-const SS=96, SSRC=56, SSCALE=SS/SSRC;
-function bakeSprite(draw){
-  const cb=document.createElement('canvas'); cb.width=cb.height=SS;
-  const cg=document.createElement('canvas'); cg.width=cg.height=SS;
-  const gb=cb.getContext('2d'), gg=cg.getContext('2d');
-  gb.scale(SSCALE,SSCALE); gg.scale(SSCALE,SSCALE);
-  gb.imageSmoothingEnabled=false; gg.imageSmoothingEnabled=false;
-  draw(gb,gg);
-  const db=new Uint32Array(gb.getImageData(0,0,SS,SS).data.buffer).slice();
-  const dgRaw=gg.getImageData(0,0,SS,SS).data;
-  const glow=new Uint8Array(SS*SS), gcol=new Uint32Array(SS*SS);
-  for(let i=0;i<SS*SS;i++){
-    const a=dgRaw[i*4+3];
-    if(a>24){glow[i]=a; gcol[i]=pack(dgRaw[i*4],dgRaw[i*4+1],dgRaw[i*4+2]);}
-  }
-  return {d:db,glow:glow,gcol:gcol};
+/* ---------------------------- glow sprites ---------------------------
+   Only soft light is billboarded now — the eye bloom and the lamp
+   flame. Everything solid is built out of boxes and rasterised.    */
+const SS=64;
+function bakeGlow(draw){
+  const c=document.createElement('canvas'); c.width=c.height=SS;
+  const g=c.getContext('2d'); draw(g);
+  const raw=g.getImageData(0,0,SS,SS).data;
+  const a=new Uint8Array(SS*SS), col=new Uint32Array(SS*SS);
+  for(let i=0;i<SS*SS;i++){ a[i]=raw[i*4+3]; col[i]=pack(raw[i*4],raw[i*4+1],raw[i*4+2]); }
+  return {a:a,col:col};
 }
-function rr(g,x,y,w,h,r,col){
-  g.fillStyle=col; g.beginPath();
-  if(g.roundRect){g.roundRect(x,y,w,h,r);}else{g.rect(x,y,w,h);}
-  g.fill();
-}
-/* a squat angry robot terrapin: riveted shell, bandana, glowing eye slit,
-   iron jaw, claw hands, two stubby servo legs                          */
-function drawBot(gb,gg,phase,mode,hurt){
-  const sw=Math.sin(phase*TAU), cw=Math.cos(phase*TAU);
-  const cx=28, bob=mode===2?2:Math.abs(sw)*1.2;
-  const lunge=mode===2?3:0;
-  const base=52;
-  // legs
-  for(const s of [-1,1]){
-    const sl=s>0?sw:-sw;
-    const lx=cx+s*7, ly=base-7+sl*1.5;
-    rr(gb,lx-4,ly-3,8,8,2,'#2a2f2a');
-    rr(gb,lx-5,ly+3+sl*2,10,4,2,'#15181a');          // foot
-    rr(gb,lx-3,ly-2,3,6,1,'#3b4340');                 // highlight
-  }
-  // tail
-  rr(gb,cx+11,base-13,7,4,2,'#232a24');
-  // shell (back dome)
-  const shell=hurt?'#4a3a22':'#2c4024';
-  rr(gb,cx-15,24-lunge,30,22,10,shell);
-  rr(gb,cx-15,24-lunge,30,10,8,'#38502c');
-  // shell plates
-  gb.fillStyle='#1d2a18';
-  for(let i=0;i<3;i++)for(let j=0;j<2;j++){
-    const px0=cx-11+i*8, py0=28-lunge+j*7;
-    gb.beginPath();gb.moveTo(px0,py0-3);gb.lineTo(px0+4,py0);gb.lineTo(px0,py0+3);gb.lineTo(px0-4,py0);
-    gb.closePath();gb.fill();
-  }
-  // rim / belly plate
-  rr(gb,cx-13,42-lunge,26,7,3,'#4a4034');
-  rr(gb,cx-9,44-lunge,18,3,1,'#6a5a44');
-  // rivets
-  gb.fillStyle='#6d6450';
-  for(let i=0;i<6;i++){const a=i/6*Math.PI; gb.fillRect(cx-14+Math.cos(a)*13|0,27-lunge+Math.sin(a)*2|0,2,2);}
-  // arms + claws
-  for(const s of [-1,1]){
-    const sa=(mode===2?1:0.4)*(s>0?cw:-cw);
-    const ax=cx+s*15, ay=34-lunge+sa*3;
-    rr(gb,ax-3,ay-2,7,11,3,'#2f352f');
-    gb.fillStyle='#8d8268';
-    gb.fillRect(ax-3,ay+8,3,5); gb.fillRect(ax+1,ay+8,3,4);  // claws
-  }
-  // head
-  const hy=20-lunge+(mode===2?2:0);
-  rr(gb,cx-9,hy-10,18,14,5,'#39443a');
-  rr(gb,cx-9,hy-10,18,5,4,'#49553f');
-  // bandana
-  rr(gb,cx-10,hy-6,20,4,1,hurt?'#6d1d14':'#8e2016');
-  rr(gb,cx+8,hy-6,7,3,1,hurt?'#6d1d14':'#8e2016');
-  rr(gb,cx+9,hy-2+Math.abs(sw)*1.5,6,3,1,'#71180f');
-  // jaw
-  const open=mode===2?4:1;
-  rr(gb,cx-7,hy+3,14,2+open,2,'#262b26');
-  gb.fillStyle='#cfc6ad';
-  for(let i=0;i<5;i++) gb.fillRect(cx-6+i*3,hy+3,2,2+ (i%2?1:0));
-  if(mode===2){gb.fillStyle='#cfc6ad';for(let i=0;i<4;i++)gb.fillRect(cx-5+i*3,hy+3+open,2,2);}
-  // antenna
-  gb.strokeStyle='#5a5444';gb.lineWidth=1;
-  gb.beginPath();gb.moveTo(cx-2,hy-10);gb.lineTo(cx-4+sw*2,hy-17);gb.stroke();
+const GLOW=bakeGlow(g=>{
+  const r=g.createRadialGradient(32,32,1,32,32,31);
+  r.addColorStop(0,'rgba(255,255,255,1)');
+  r.addColorStop(.22,'rgba(255,255,255,.62)');
+  r.addColorStop(.55,'rgba(255,255,255,.18)');
+  r.addColorStop(1,'rgba(255,255,255,0)');
+  g.fillStyle=r; g.fillRect(0,0,SS,SS);
+});
+const FLAME=bakeGlow(g=>{
+  const r=g.createRadialGradient(32,34,1,32,34,30);
+  r.addColorStop(0,'rgba(255,246,214,1)');
+  r.addColorStop(.18,'rgba(255,206,126,.8)');
+  r.addColorStop(.5,'rgba(255,160,70,.3)');
+  r.addColorStop(1,'rgba(255,120,40,0)');
+  g.fillStyle=r; g.fillRect(0,0,SS,SS);
+  g.fillStyle='rgba(255,250,228,.95)';
+  g.beginPath(); g.ellipse(32,32,4,8,0,0,TAU); g.fill();
+});
 
-  /* ---- glow layer ---- */
-  const eye=mode===0?'#b8471d':(mode===1?'#d96a12':'#ff2a14');
-  gg.fillStyle=eye;
-  gg.fillRect(cx-7,hy-4,5,2); gg.fillRect(cx+2,hy-4,5,2);     // eye slits
-  if(mode===2){gg.fillRect(cx-7,hy-5,5,1);gg.fillRect(cx+2,hy-5,5,1);}
-  gg.fillStyle='#2ad6b0'; gg.fillRect(cx-1,42-lunge+1,3,3);    // chest lamp
-  gg.fillStyle='#ff5a2a'; gg.fillRect(cx-4.5+sw*2,hy-18.5,1.6,1.6);// antenna tip
-  if(hurt){gg.fillStyle='#ffd27a';
-    for(let i=0;i<4;i++)gg.fillRect(cx-12+irnd(24),26-lunge+irnd(16),1,1);}
+/* ============================ tiny 3D engine =========================
+   Models are lists of boxes. Each box carries a colour (or an emissive
+   colour), an optional pivot and an animation channel. Faces are flat
+   shaded off the nearest lamp and depth tested per pixel against the
+   same inverse-depth buffer the walls and floor write into.        */
+const BOX_FACE=[
+  {i:[1,3,7,5],n:[ 1, 0, 0]}, {i:[0,2,6,4],n:[-1, 0, 0]},
+  {i:[2,3,7,6],n:[ 0, 1, 0]}, {i:[0,1,5,4],n:[ 0,-1, 0]},
+  {i:[4,5,7,6],n:[ 0, 0, 1]}, {i:[0,1,3,2],n:[ 0, 0,-1]}
+];
+// scratch space, reused every frame
+const vX=new Float64Array(8), vY=new Float64Array(8), vZ=new Float64Array(8);
+const sX=new Float64Array(8), sY=new Float64Array(8), sF=new Float64Array(8);
+
+function part(c,h,col,o){
+  const p={cx:c[0],cy:c[1],cz:c[2],hx:h[0],hy:h[1],hz:h[2],
+           col:col,emis:null,anim:null,ph:0,px:0,py:0,pz:0};
+  if(o){ if(o.emis)p.emis=o.emis; if(o.anim)p.anim=o.anim; if(o.ph!==undefined)p.ph=o.ph;
+         if(o.pivot){p.px=o.pivot[0];p.py=o.pivot[1];p.pz=o.pivot[2];} }
+  return p;
 }
-const BOT={};
-for(const mode of [0,1,2]){                       // 0 idle/patrol 1 alert 2 attack
-  BOT[mode]=[];
-  for(let f=0;f<4;f++) BOT[mode].push(bakeSprite((gb,gg)=>drawBot(gb,gg,f/4,mode,false)));
+/* ---- the vermin: a dog-sized armoured rodent with one lamp of an eye ---- */
+const STEEL=[64,70,60], STEEL2=[52,58,50], DARK=[30,34,30], BRASS=[122,96,44],
+      BONE=[198,188,160], RUST=[96,62,34];
+function makeRat(){
+  const p=[], NECK=[0.255,0,0.225], JAW=[0.40,0,0.198];
+  const head=o=>Object.assign({anim:'head',pivot:NECK},o||{});
+  // trunk: heavy haunches, a hunched back, shoulders carried low
+  p.push(part([-0.175,0,0.240],[0.130,0.112,0.118],STEEL2));        // haunches
+  p.push(part([ 0.000,0,0.228],[0.150,0.098,0.102],STEEL));         // barrel
+  p.push(part([ 0.170,0,0.202],[0.085,0.082,0.080],STEEL2));        // shoulders
+  p.push(part([-0.165,0,0.358],[0.062,0.056,0.020],BRASS));         // dorsal plates
+  p.push(part([-0.020,0,0.342],[0.072,0.050,0.018],BRASS));
+  p.push(part([ 0.110,0,0.300],[0.050,0.044,0.016],RUST));
+  p.push(part([ 0.100,0,0.132],[0.150,0.068,0.028],DARK));          // belly pan
+  p.push(part([-0.205,0,0.300],[0.048,0.050,0.030],RUST));          // rump
+  // head, hung off the neck joint
+  p.push(part([ 0.255,0,0.222],[0.050,0.058,0.055],DARK,head()));   // neck
+  p.push(part([ 0.345,0,0.238],[0.085,0.072,0.066],STEEL,head()));  // skull
+  p.push(part([ 0.448,0,0.212],[0.058,0.044,0.040],STEEL2,head())); // snout
+  p.push(part([ 0.300,0,0.300],[0.050,0.050,0.016],BRASS,head()));  // crown plate
+  p.push(part([ 0.408,0,0.262],[0.046,0.056,0.056],DARK,head()));   // eye housing
+  p.push(part([ 0.462,0,0.262],[0.016,0.044,0.044],null,
+              Object.assign(head(),{emis:[255,66,26]})));           // the one eye
+  p.push(part([ 0.300, 0.078,0.306],[0.018,0.012,0.040],STEEL2,head()));  // ears
+  p.push(part([ 0.300,-0.078,0.306],[0.018,0.012,0.040],STEEL2,head()));
+  p.push(part([ 0.432, 0.060,0.196],[0.030,0.006,0.005],BRASS,head()));   // whisker rods
+  p.push(part([ 0.432,-0.060,0.196],[0.030,0.006,0.005],BRASS,head()));
+  p.push(part([ 0.500,0,0.176],[0.046,0.032,0.013],BONE,
+              {anim:'jaw',pivot:JAW}));                             // incisors
+  p.push(part([ 0.455,0,0.168],[0.042,0.040,0.016],DARK,
+              {anim:'jaw',pivot:JAW}));                             // lower jaw
+  // four legs on hip pivots, diagonal pairs in step
+  const hips=[[ 0.160, 0.092,'legA'],[ 0.160,-0.092,'legB'],
+              [-0.150, 0.100,'legB'],[-0.150,-0.100,'legA']];
+  hips.forEach(hp=>{
+    const piv=[hp[0],hp[1],0.170];
+    p.push(part([hp[0],hp[1],0.112],[0.032,0.032,0.060],STEEL2,{anim:hp[2],pivot:piv}));
+    p.push(part([hp[0],hp[1],0.044],[0.026,0.026,0.032],DARK,  {anim:hp[2],pivot:piv}));
+    p.push(part([hp[0]+0.022,hp[1],0.014],[0.044,0.024,0.014],DARK,{anim:hp[2],pivot:piv}));
+  });
+  // a segmented iron tail
+  const TP=[-0.28,0,0.250];
+  p.push(part([-0.350,0,0.255],[0.080,0.026,0.026],STEEL2,{anim:'tail1',pivot:TP}));
+  p.push(part([-0.490,0,0.280],[0.070,0.020,0.020],DARK,  {anim:'tail2',pivot:TP}));
+  p.push(part([-0.600,0,0.315],[0.055,0.015,0.015],RUST,  {anim:'tail3',pivot:TP}));
+  return p;
 }
-const BOT_HURT=bakeSprite((gb,gg)=>drawBot(gb,gg,.25,2,true));
-const BOT_DEAD=bakeSprite((gb,gg)=>{
-  // a heap of scrap, half in the muck
-  rr(gb,14,44,30,9,4,'#26321f');
-  rr(gb,20,40,16,7,3,'#39443a');
-  rr(gb,36,46,10,5,2,'#4a4034');
-  gb.fillStyle='#8d8268'; gb.fillRect(16,50,4,2); gb.fillRect(42,50,4,2);
-  rr(gb,24,47,12,3,1,'#71180f');
-  gg.fillStyle='#4a1208'; gg.fillRect(26,42,4,1);
-});
-const LOOT_SPR=bakeSprite((gb,gg)=>{
-  // a little reliquary: gold cup, jewelled stem
-  rr(gb,22,22,12,10,2,'#b08b36');
-  rr(gb,24,23,8,3,1,'#e0bf71');
-  rr(gb,26,32,4,8,1,'#8d6f2a');
-  rr(gb,21,40,14,4,2,'#a8822f');
-  rr(gb,25,18,6,4,1,'#c9a257');
-  gg.fillStyle='#ffe6a0'; gg.fillRect(26,19,4,2); gg.fillRect(23,25,2,2);
-  gg.fillStyle='#8fd8ff'; gg.fillRect(27,34,2,2);
-});
-const LAMP_SPR=bakeSprite((gb,gg)=>{
-  rr(gb,24,16,8,3,1,'#3b3730');
-  rr(gb,22,19,12,14,2,'#2a2722');
-  rr(gb,23,20,10,12,1,'#1b1812');
-  rr(gb,21,33,14,3,1,'#3b3730');
-  const halo=gg.createRadialGradient(28,26,1,28,26,16);
-  halo.addColorStop(0,'rgba(255,214,140,.95)');
-  halo.addColorStop(.35,'rgba(255,180,90,.45)');
-  halo.addColorStop(1,'rgba(255,150,60,0)');
-  gg.fillStyle=halo; gg.beginPath(); gg.arc(28,26,16,0,TAU); gg.fill();
-  gg.fillStyle='#ffcb6b'; gg.fillRect(25,22,6,9);
-  gg.fillStyle='#fff6d8'; gg.fillRect(27,24,2,5);
-});
+const RAT=makeRat();
+/* a reliquary: stacked boxes of gold, with a jewel that catches the light */
+const RELIC=[
+  part([0,0,0.055],[0.075,0.075,0.020],[138,110,52]),
+  part([0,0,0.100],[0.030,0.030,0.040],[112,88,40]),
+  part([0,0,0.165],[0.070,0.070,0.055],[168,134,62]),
+  part([0,0,0.168],[0.074,0.030,0.030],[196,162,82]),
+  part([0,0,0.230],[0.040,0.040,0.020],[150,118,52]),
+  part([0,0,0.258],[0.016,0.016,0.016],null,{emis:[255,224,150]})
+];
+/* the wall lamp: an iron box with a flame inside */
+const LAMPMDL=[
+  part([0,0,0.14],[0.030,0.030,0.140],[46,42,36]),
+  part([0,0,0.00],[0.075,0.075,0.016],[40,36,31]),
+  part([0,0,-0.10],[0.058,0.058,0.088],[34,31,27]),
+  part([0,0,-0.19],[0.070,0.070,0.014],[46,42,36]),
+  part([0,0,-0.10],[0.040,0.040,0.060],null,{emis:[255,208,128]})
+];
+
+/* animation channels: returns [pitch, yaw] for a part, in radians */
+function animOf(ch,ph,e){
+  const gait=e.gait||0, sw=Math.sin(gait), cw=Math.cos(gait);
+  switch(ch){
+    case 'legA': return [sw*e.stride,0];
+    case 'legB': return [-sw*e.stride,0];
+    case 'head': return [-0.10+cw*0.05*e.stride+ (e.burst>0?-0.18:0), e.look||0];
+    case 'jaw':  return [e.jaw||0,0];
+    case 'tail1':return [0.10+cw*0.05, Math.sin(gait*.5)*0.22];
+    case 'tail2':return [0.16, Math.sin(gait*.5-0.5)*0.34];
+    case 'tail3':return [0.22, Math.sin(gait*.5-1.0)*0.46];
+  }
+  return [0,0];
+}
+
+/* draw one model. pos in world metres, yaw radians, roll for the dead. */
+function drawModel(parts,px0,py0,pz0,yaw,e,scale,roll,tint,flat){
+  const cy=Math.cos(yaw), sy=Math.sin(yaw);
+  const cr=Math.cos(roll||0), sr=Math.sin(roll||0);
+  const sc=scale||1;
+  // the dominant lamp, for a face normal to lean into
+  let lx=0,ly=0,lz=1,best=-1;
+  for(const l of LAMPS){
+    const d=(l.x-px0)*(l.x-px0)+(l.y-py0)*(l.y-py0);
+    const w=l.i*l.f/(1+d);
+    if(w>best){best=w;lx=l.x-px0;ly=l.y-py0;lz=0.75;}
+  }
+  let ll=Math.hypot(lx,ly,lz)||1; lx/=ll;ly/=ll;lz/=ll;
+  const dxp=px0-player.x, dyp=py0-player.y;
+  const dist=Math.hypot(dxp,dyp);
+  const amb=lightAt(px0,py0)*flick
+          + 0.44/(1+dist*dist*.55) + (player.muzzle>0?3.4:0)/(1+dist*dist*.1);
+  const fog=1/(1+dist*dist*.030);
+  const eyeZ=player.eyeZ();
+  const dirX=player.dirX,dirY=player.dirY,rgX=-dirY,rgY=dirX;
+  const projD=(W/2)/FOV_H, horizon=H*0.5+Math.tan(player.pitch)*projD;
+
+  for(const p of parts){
+    let pitch=0,pyaw=0;
+    if(p.anim&&e){ const a=animOf(p.anim,p.ph,e); pitch=a[0]; pyaw=a[1]; }
+    const cp=Math.cos(pitch),sp=Math.sin(pitch),cq=Math.cos(pyaw),sq=Math.sin(pyaw);
+    for(let i=0;i<8;i++){
+      let x=p.cx+((i&1)?p.hx:-p.hx), y=p.cy+((i&2)?p.hy:-p.hy), z=p.cz+((i&4)?p.hz:-p.hz);
+      // part rotation about its pivot: pitch about y, then yaw about z
+      x-=p.px; y-=p.py; z-=p.pz;
+      let x1=x*cp+z*sp, z1=-x*sp+z*cp;
+      let x2=x1*cq-y*sq, y2=x1*sq+y*cq;
+      x=x2+p.px; y=y2+p.py; z=z1+p.pz;
+      // model roll (only the dead use it), then scale, yaw, translate
+      if(roll){ const y3=y*cr-z*sr, z3=y*sr+z*cr; y=y3; z=z3; }
+      x*=sc; y*=sc; z*=sc;
+      vX[i]=px0+x*cy-y*sy; vY[i]=py0+x*sy+y*cy; vZ[i]=pz0+z;
+      // camera
+      const dx=vX[i]-player.x, dy=vY[i]-player.y;
+      const f=dx*dirX+dy*dirY, r=dx*rgX+dy*rgY, u=vZ[i]-eyeZ;
+      sF[i]=f;
+      if(f>0.02){ sX[i]=(W/2)*(1+r/(FOV_H*f)); sY[i]=horizon-u*projD/f; }
+      else { sX[i]=0; sY[i]=0; }
+    }
+    for(const fc of BOX_FACE){
+      const I=fc.i;
+      if(sF[I[0]]<0.14||sF[I[1]]<0.14||sF[I[2]]<0.14||sF[I[3]]<0.14)continue;
+      // world normal
+      let nx=fc.n[0],ny=fc.n[1],nz=fc.n[2];
+      const n1x=nx*cp+nz*sp, n1z=-nx*sp+nz*cp;
+      const n2x=n1x*cq-ny*sq, n2y=n1x*sq+ny*cq;
+      nx=n2x; ny=n2y; nz=n1z;
+      if(roll){ const t1=ny*cr-nz*sr, t2=ny*sr+nz*cr; ny=t1; nz=t2; }
+      const wnx=nx*cy-ny*sy, wny=nx*sy+ny*cy, wnz=nz;
+      // backface cull against the view ray
+      const mx=(vX[I[0]]+vX[I[2]])*.5-player.x, my=(vY[I[0]]+vY[I[2]])*.5-player.y,
+            mz=(vZ[I[0]]+vZ[I[2]])*.5-eyeZ;
+      if(wnx*mx+wny*my+wnz*mz>0)continue;
+      let r8,g8,b8;
+      if(p.emis){
+        const k=(p.emis===RAT_EYE_COL?1:1)*(0.72+0.28*flick)*(e&&e.eyeFlare?e.eyeFlare:1);
+        r8=clamp(p.emis[0]*k,0,255); g8=clamp(p.emis[1]*k,0,255); b8=clamp(p.emis[2]*k,0,255);
+        const ff=0.35+0.65*fog;
+        r8*=ff; g8*=ff; b8*=ff;
+      }else{
+        const ndl=Math.max(0,wnx*lx+wny*ly+wnz*lz);
+        const shade=flat?0.92:(0.30+0.70*ndl+(wnz>0.5?0.12:0));
+        const L=amb*shade;
+        const c=tint||p.col;
+        r8=clamp(c[0]*(AMB_R+WARM_R*L)*fog,0,255);
+        g8=clamp(c[1]*(AMB_G+WARM_G*L)*fog,0,255);
+        b8=clamp(c[2]*(AMB_B+WARM_B*L)*fog,0,255);
+      }
+      const col=pack(r8|0,g8|0,b8|0);
+      rasterTri(I[0],I[1],I[2],col); rasterTri(I[0],I[2],I[3],col);
+    }
+  }
+}
+const RAT_EYE_COL=null;
+
+/* flat triangle, inverse-depth tested, from the scratch screen arrays */
+function rasterTri(a,b,c,col){
+  const x0=sX[a],y0=sY[a],x1=sX[b],y1=sY[b],x2=sX[c],y2=sY[c];
+  const w0=1/sF[a], w1=1/sF[b], w2=1/sF[c];
+  let minx=Math.floor(Math.min(x0,x1,x2)), maxx=Math.ceil(Math.max(x0,x1,x2));
+  let miny=Math.floor(Math.min(y0,y1,y2)), maxy=Math.ceil(Math.max(y0,y1,y2));
+  if(minx<0)minx=0; if(miny<0)miny=0; if(maxx>W-1)maxx=W-1; if(maxy>H-1)maxy=H-1;
+  if(minx>maxx||miny>maxy)return;
+  const d=(y1-y2)*(x0-x2)+(x2-x1)*(y0-y2);
+  if(d>-1e-7&&d<1e-7)return;
+  const inv=1/d;
+  for(let y=miny;y<=maxy;y++){
+    const py=y+0.5; let row=y*W;
+    const e0b=(x2-x1)*(py-y2), e1b=(x0-x2)*(py-y2);
+    for(let x=minx;x<=maxx;x++){
+      const pxc=x+0.5;
+      const l0=((y1-y2)*(pxc-x2)+e0b)*inv; if(l0<0)continue;
+      const l1=((y2-y0)*(pxc-x2)+e1b)*inv; if(l1<0)continue;
+      const l2=1-l0-l1; if(l2<0)continue;
+      const w=l0*w0+l1*w1+l2*w2;
+      const i=row+x;
+      if(w>dbuf[i]){ dbuf[i]=w; buf[i]=col; }
+    }
+  }
+}
+/* additive billboard, for light that has no surface */
+function drawGlowSprite(spr,x,y,z,size,r,g,b,strength){
+  const dirX=player.dirX,dirY=player.dirY;
+  const dx=x-player.x, dy=y-player.y;
+  const f=dx*dirX+dy*dirY; if(f<0.14)return;
+  const rr2=dx*(-dirY)+dy*dirX;
+  const projD=(W/2)/FOV_H, eyeZ=player.eyeZ();
+  const horizon=H*0.5+Math.tan(player.pitch)*projD;
+  const scrX=(W/2)*(1+rr2/(FOV_H*f)), scrY=horizon-(z-eyeZ)*projD/f;
+  const s=size*projD/f; if(s<1)return;
+  const w=1/f;
+  const x0=Math.floor(scrX-s/2), x1=Math.ceil(scrX+s/2);
+  const y0=Math.floor(scrY-s/2), y1=Math.ceil(scrY+s/2);
+  const fog=1/(1+f*f*.022);
+  const k=strength*fog;
+  for(let yy=Math.max(0,y0);yy<=Math.min(H-1,y1);yy++){
+    const ty=((yy-y0)/s*SS)|0; if(ty<0||ty>=SS)continue;
+    const row=yy*W, trow=ty*SS;
+    for(let xx=Math.max(0,x0);xx<=Math.min(W-1,x1);xx++){
+      const i=row+xx;
+      if(w<dbuf[i])continue;                       // behind something solid
+      const tx=((xx-x0)/s*SS)|0; if(tx<0||tx>=SS)continue;
+      const a=spr.a[trow+tx]; if(a<6)continue;
+      const m=a/255*k, old=buf[i];
+      buf[i]=pack(Math.min(255,(old&255)+r*m)|0,
+                  Math.min(255,((old>>8)&255)+g*m)|0,
+                  Math.min(255,((old>>16)&255)+b*m)|0);
+    }
+  }
+}
 
 /* ------------------------------ entities ------------------------------ */
 const player={
@@ -695,7 +986,9 @@ const enemies=[];
 function spawnBot(x,y){
   enemies.push({x:x,y:y, hp:100, state:0, t:0, anim:Math.random(),
     tx:x,ty:y, barkCd:rnd(.5,3), biteCd:0, windup:0, hurtT:0, dead:0,
-    vx:0,vy:0, seen:0, lastSeen:0, searchT:0, spd:0, home:{x:x,y:y}});
+    vx:0,vy:0, seen:0, lastSeen:0, searchT:0, spd:0, home:{x:x,y:y},
+    face:rnd(0,TAU), gait:rnd(0,TAU), stride:0, jaw:0, look:0,
+    burst:0, burstCd:rnd(4,18), eyeFlare:1});
 }
 [[3.5,9.5],[10.5,5.5],[18.5,8.5],[15.5,16.5],[6.5,18.5],[11.5,11.5],[19.5,17.5],[5.5,5.5]]
   .forEach(p=>spawnBot(p[0],p[1]));
@@ -790,22 +1083,25 @@ function shoot(){
   const a=player.ang+rnd(-spread,spread);
   const pz=player.eyeZ()+rnd(-spread,spread)*2;
   const dx=Math.cos(a),dy=Math.sin(a),dz=Math.tan(player.pitch)+rnd(-spread,spread)*2;
-  let hitEnemy=null,hx=0,hy=0,hz=0;
+  let hitEnemy=null,hx=0,hy=0,hz=0,headShot=false;
   const STEP=.045;
   for(let t=.3;t<26;t+=STEP){
     const x=player.x+dx*t, y=player.y+dy*t, z=pz+dz*t;
     if(z<0||z>1){ hx=x;hy=y;hz=clamp(z,0,1); break; }
     if(at(x|0,y|0)!==0){ hx=x;hy=y;hz=z; break; }
-    let found=null;
+    let found=null, head=false;
     for(const e of enemies){
       if(e.dead)continue;
+      const hxp=e.x+Math.cos(e.face)*0.38, hyp=e.y+Math.sin(e.face)*0.38;
+      const hdx=x-hxp, hdy=y-hyp;
+      if(hdx*hdx+hdy*hdy<.024 && z>.17 && z<.36){ found=e; head=true; break; }
       const ddx=x-e.x, ddy=y-e.y;
-      if(ddx*ddx+ddy*ddy<.115 && z<.82){ found=e; break; }
+      if(ddx*ddx+ddy*ddy<.085 && z<.40){ found=e; break; }
     }
-    if(found){ hitEnemy=found; hx=x;hy=y;hz=z; break; }
+    if(found){ hitEnemy=found; hx=x;hy=y;hz=z; headShot=head; break; }
   }
   if(hitEnemy){
-    damageBot(hitEnemy,hz>.58?100:62,dx,dy);
+    damageBot(hitEnemy,headShot?120:62,dx,dy);
     hitMark();
   }else if(hx){
     spark(hx-dx*.05,hy-dy*.05,hz,5,0);
@@ -864,7 +1160,7 @@ function updatePlayer(dt){
     const sp=Math.hypot(player.vx,player.vy)||1;
     player.vx=player.vx/sp*6.4; player.vy=player.vy/sp*6.4;
     player.noise=Math.max(player.noise,7);
-    sStep(inWater(player.x,player.y));
+    sSlide(inWater(player.x,player.y));
   }
   player.slide=Math.max(0,player.slide-dt);
   player.slideCd=Math.max(0,player.slideCd-dt);
@@ -888,7 +1184,14 @@ function updatePlayer(dt){
     player.vz=3.55; player.noise=Math.max(player.noise,6); player.jumpBuf=0;
   }
   player.vz-=14.5*dt; player.z+=player.vz*dt;
-  if(player.z<=0){ if(player.vz<-3){sStep(water);player.noise=Math.max(player.noise,8);} player.z=0; player.vz=0; }
+  if(player.z<=0){
+    if(player.vz<-2.4){
+      const hard=clamp(-player.vz/4.2,0,1);
+      player.noise=Math.max(player.noise,4+hard*6);
+      sLand(hard,water);
+    }
+    player.z=0; player.vz=0;
+  }
 
   tryMove(player,player.vx*dt,player.vy*dt);
   player.speed=Math.hypot(player.vx,player.vy);
@@ -898,8 +1201,12 @@ function updatePlayer(dt){
     player.bob+=player.speed*dt*3.1;
     player.stepPhase+=player.speed*dt*(player.crouch?1.3:2.1);
     if(player.stepPhase>Math.PI){ player.stepPhase-=Math.PI;
-      if(player.speed>.4){ sStep(water);
-        player.noise=Math.max(player.noise, player.crouch?1.6:(wantRun?11:5)*(water?1.6:1)); }
+      if(player.speed>.4){
+        let n=player.crouch?1.6:(wantRun?11:5);
+        if(water)n*=1.6;
+        player.noise=Math.max(player.noise,n);
+        sStep(water,clamp(n/12,0,1));          // you hear precisely what they hear
+      }
     }
   }
   player.noise=Math.max(0,player.noise-dt*9);
@@ -956,7 +1263,7 @@ function die(){
     document.getElementById('endh').textContent='DEAD IN THE DARK';
     document.getElementById('endp').textContent=
       'They dragged you under. Relics recovered: '+player.loot+' of '+loots.length+
-      ' — terrapins scrapped: '+kills+'.';
+      ' — vermin scrapped: '+kills+'.';
   },1100);
 }
 function win(){
@@ -965,7 +1272,7 @@ function win(){
   endEl.classList.remove('hide'); endEl.classList.add('win');
   document.getElementById('endh').textContent='OUT, AND RICH';
   document.getElementById('endp').textContent=
-    'Four reliquaries, '+kills+' terrapins scrapped, and the city none the wiser.';
+    'Four reliquaries, '+kills+' of the vermin scrapped, and the city none the wiser.';
 }
 function restart(){
   player.x=3;player.y=3.2;player.vx=player.vy=player.vz=0;player.z=0;
@@ -988,13 +1295,13 @@ function restart(){
    They see you by light level and line of sight, hear your boots, and
    sprint. Two shots from the pistol or one to the head, and they're
    scrap; two bites and you're done.                                   */
-const BOT_WALK=1.25, BOT_SPRINT=3.95;
+const BOT_PROWL=1.15, BOT_TROT=2.05, BOT_BURST=6.2;
 function canSee(e){
   const d=Math.hypot(player.x-e.x,player.y-e.y);
   if(d>13)return 0;
   const dx=(player.x-e.x)/d, dy=(player.y-e.y)/d;
   const facing=dx*Math.cos(e.face||0)+dy*Math.sin(e.face||0);
-  if(e.state<2 && facing<.12 && d>1.6)return 0;                  // behind them
+  if(e.state<2 && facing<.12 && d>1.6)return 0;                  // one eye, no neck
   if(!losClear(e.x,e.y,player.x,player.y))return 0;
   const lit=lightAt(player.x,player.y)+(player.muzzle>0?2:0);
   const vis=(lit*1.5+.18)*(1-d/14)*(player.crouch?.6:1)*(player.speed>3?1.5:1);
@@ -1003,13 +1310,13 @@ function canSee(e){
 function updateBots(dt){
   if(player.won)return;
   for(const e of enemies){
-    if(e.dead){ e.deadT=(e.deadT||0)+dt; continue; }
+    if(e.dead){ e.deadT=(e.deadT||0)+dt; e.stride=0; e.eyeFlare=.1; continue; }
     e.t+=dt; e.hurtT=Math.max(0,e.hurtT-dt);
     e.barkCd-=dt; e.biteCd=Math.max(0,e.biteCd-dt);
+    e.burstCd=Math.max(0,e.burstCd-dt);
     const d=Math.hypot(player.x-e.x,player.y-e.y);
     const sight=player.dead?0:canSee(e);
-    // hearing
-    if(!player.dead && player.noise>0){
+    if(!player.dead && player.noise>0){                          // it heard your boots
       const heard=player.noise/(1+d*d*.08);
       if(heard>.55&&e.state<2){ e.state=1; e.searchT=6; e.tx=player.x; e.ty=player.y; }
     }
@@ -1018,7 +1325,7 @@ function updateBots(dt){
 
     let spd=0, tx=e.tx, ty=e.ty;
     if(e.state===0){
-      spd=BOT_WALK;
+      spd=BOT_PROWL;
       if(Math.hypot(tx-e.x,ty-e.y)<.5||e.patT===undefined||((e.patT-=dt)<0)){
         e.patT=rnd(3,8);
         for(let k=0;k<24;k++){
@@ -1028,7 +1335,7 @@ function updateBots(dt){
         }
       }
     }else if(e.state===1){
-      spd=BOT_WALK*1.9; e.searchT-=dt;
+      spd=BOT_TROT*.85; e.searchT-=dt;
       if(e.searchT<=0)e.state=0;
       if(Math.hypot(tx-e.x,ty-e.y)<.6){
         for(let k=0;k<16;k++){
@@ -1037,46 +1344,63 @@ function updateBots(dt){
           if(!solid(nx,ny)){ e.tx=nx;e.ty=ny;break; }
         }
       }
-      if(e.barkCd<=0&&Math.random()<.35){ sBark(e.x,e.y); e.barkCd=rnd(1.6,3.4); }
+      if(e.barkCd<=0&&Math.random()<.35){ sBark(e.x,e.y); e.barkCd=rnd(1.8,3.6); }
     }else{
-      spd=BOT_SPRINT; tx=player.x; ty=player.y;
-      if(e.barkCd<=0){ sBark(e.x,e.y); e.barkCd=rnd(.55,1.5); }
+      /* chasing: it trots most of the time and spends its charge rarely —
+         a dash it has to wind up for, then wind down from.              */
+      spd=BOT_TROT; tx=player.x; ty=player.y;
+      if(e.barkCd<=0){ sBark(e.x,e.y); e.barkCd=rnd(1.1,2.6); }
+      if(e.burstCd<=0&&e.burst<=0&&d>1.1&&d<13&&losClear(e.x,e.y,player.x,player.y)){
+        e.burst=1.55; e.burstCd=rnd(17,24); sScreech(e.x,e.y);
+      }
       if(d<1.0&&e.biteCd<=0&&!player.dead){ e.windup=.18; e.biteCd=.95; }
     }
+    if(e.burst>0){
+      e.burst-=dt;
+      const ramp=clamp(e.burst/1.55*3,0,1)*clamp((1.55-e.burst)*6,0,1);
+      spd=lerp(spd,BOT_BURST,ramp);
+      e.eyeFlare=1+2.2*ramp;
+      if(e.burst<=0)e.burstCd=Math.max(e.burstCd,rnd(16,23));
+    }else e.eyeFlare=lerp(e.eyeFlare||1,e.state===2?1.35:1,Math.min(1,dt*3));
     if(e.windup>0){
-      e.windup-=dt; spd=.4;
+      e.windup-=dt; spd=.4; e.jaw=.55;
       if(e.windup<=0){
+        e.jaw=0;
         if(Math.hypot(player.x-e.x,player.y-e.y)<1.35&&losClear(e.x,e.y,player.x,player.y)){
           sBite(e.x,e.y); hurtPlayer(52);
         }else sBite(e.x,e.y);
       }
-    }
-    // steer: straight at the target, slide along walls when blocked
+    }else e.jaw=lerp(e.jaw||0,e.state===2?.16:0,Math.min(1,dt*6));
+
     let ax=tx-e.x, ay=ty-e.y; const al=Math.hypot(ax,ay)||1; ax/=al; ay/=al;
     if(solid(e.x+ax*.45,e.y+ay*.45)){
-      // try the two tangents
       const t1x=-ay,t1y=ax, s1=!solid(e.x+t1x*.5,e.y+t1y*.5);
       const t2x=ay,t2y=-ax, s2=!solid(e.x+t2x*.5,e.y+t2y*.5);
       if(s1&&(!s2||(e.turn=e.turn||(Math.random()<.5?1:-1))>0)){ax=t1x;ay=t1y;}
       else if(s2){ax=t2x;ay=t2y;}
     }
-    // separation so they don't stack into one sprite
-    for(const o of enemies){
+    for(const o of enemies){                                     // don't pile up
       if(o===e||o.dead)continue;
       const ox=e.x-o.x, oy=e.y-o.y, od=Math.hypot(ox,oy);
       if(od<.72&&od>.001){ ax+=ox/od*1.3; ay+=oy/od*1.3; }
     }
     const inW=inWater(e.x,e.y); if(inW)spd*=.8;
     const nl=Math.hypot(ax,ay)||1;
-    e.vx=lerp(e.vx,ax/nl*spd,Math.min(1,dt*9));
-    e.vy=lerp(e.vy,ay/nl*spd,Math.min(1,dt*9));
-    tryMove(e,e.vx*dt,e.vy*dt,.3);
+    e.vx=lerp(e.vx,ax/nl*spd,Math.min(1,dt*(e.burst>0?12:8)));
+    e.vy=lerp(e.vy,ay/nl*spd,Math.min(1,dt*(e.burst>0?12:8)));
+    tryMove(e,e.vx*dt,e.vy*dt,.28);
     e.spd=Math.hypot(e.vx,e.vy);
-    if(e.spd>.1)e.face=Math.atan2(e.vy,e.vx);
-    e.anim+=e.spd*dt*(e.state===2?1.1:.8);
-    // splashing as they run through the sumps
+    if(e.spd>.1){
+      const want=Math.atan2(e.vy,e.vx);
+      let df=want-(e.face||0);
+      while(df>Math.PI)df-=TAU; while(df<-Math.PI)df+=TAU;
+      e.face=(e.face||0)+df*Math.min(1,dt*9);                    // turns, not snaps
+    }
+    e.gait+=e.spd*dt*7.4;                                        // four legs, quick ones
+    e.stride=clamp(e.spd/2.6,0,1.35);
+    e.look=clamp(Math.sin(e.t*.7)*.12+(e.state===2?0:Math.sin(e.t*.31)*.3),-.5,.5);
     if(inW&&e.spd>1.5){ e.splash=(e.splash||0)+dt*e.spd;
-      if(e.splash>.9){e.splash=0;sStep(true);} }
+      if(e.splash>.9){e.splash=0;sStep(true,.5);} }
   }
 }
 
@@ -1119,7 +1443,7 @@ function render(){
   const dirX=player.dirX,dirY=player.dirY,plX=player.plX,plY=player.plY;
   const pxp=player.x, pyp=player.y;
   const muz=player.muzzle>0?3.4:0;
-  buf.fill(0xFF000000);
+  buf.fill(0xFF000000); dbuf.fill(0);
 
   /* ---------------- walls (DDA) ---------------- */
   for(let x=0;x<W;x++){
@@ -1167,11 +1491,13 @@ function render(){
     const step=TS/colH;
     let texPos=(ys-yTopF)*step;
     let o=ys*W+x;
+    const wInv=1/perp;
     for(let y=ys;y<=ye;y++,o+=W){
       const ty=clamp(texPos|0,0,TMASK); texPos+=step;
       const c=tex[(ty<<6)|tx];
       const r=(c&255), g=((c>>8)&255), b=((c>>16)&255);
       buf[o]=pack(clamp(r*rF+er*fog,0,255)|0,clamp(g*gF+eg*fog,0,255)|0,clamp(b*bF+eb*fog,0,255)|0);
+      dbuf[o]=wInv;
     }
   }
 
@@ -1184,14 +1510,15 @@ function render(){
     const dy=y-horizon; if(dy<=0)continue;
     const dist=eyeZ*projD/dy;
     if(dist>30)continue;
+    const invDist=1/dist;
     const fog=1/(1+dist*dist*.030);
     const lant=0.40/(1+dist*dist*.55)+muz/(1+dist*dist*.1);
     let fx=pxp+rdlX*dist, fy=pyp+rdlY*dist;
     const stx=(rdrX-rdlX)*dist/W, sty=(rdrY-rdlY)*dist/W;
     let o=y*W;
+    let L0=lightAt(fx,fy)*flick+lant;
     for(let x=0;x<W;x+=4){
-      let L0=lightAt(fx,fy)*flick+lant;
-      let L1=lightAt(fx+stx*4,fy+sty*4)*flick+lant;
+      const L1=lightAt(fx+stx*4,fy+sty*4)*flick+lant;
       const dL=(L1-L0)/4;
       for(let k=0;k<4;k++){
         const xx=x+k;
@@ -1217,9 +1544,10 @@ function render(){
             gg2+=sp*.55; bb2+=sp*.5; rr2+=sp*.22;
           }
           buf[o+xx]=pack(clamp(rr2,0,255)|0,clamp(gg2,0,255)|0,clamp(bb2,0,255)|0);
+          dbuf[o+xx]=invDist;
         }
       }
-      fx+=stx*4; fy+=sty*4;
+      fx+=stx*4; fy+=sty*4; L0=L1;
     }
   }
   // ceiling
@@ -1228,14 +1556,15 @@ function render(){
     const dy=horizon-y; if(dy<=0)continue;
     const dist=ceilGap*projD/dy;
     if(dist>30||dist<=0)continue;
+    const invDist=1/dist;
     const fog=1/(1+dist*dist*.034);
     const lant=0.30/(1+dist*dist*.6)+muz*.7/(1+dist*dist*.1);
     let fx=pxp+rdlX*dist, fy=pyp+rdlY*dist;
     const stx=(rdrX-rdlX)*dist/W, sty=(rdrY-rdlY)*dist/W;
     let o=y*W;
+    let L0=lightAt(fx,fy)*flick*.62+lant;
     for(let x=0;x<W;x+=4){
-      let L0=lightAt(fx,fy)*flick*.62+lant;
-      let L1=lightAt(fx+stx*4,fy+sty*4)*flick*.62+lant;
+      const L1=lightAt(fx+stx*4,fy+sty*4)*flick*.62+lant;
       const dL=(L1-L0)/4;
       for(let k=0;k<4;k++){
         const xx=x+k; if(xx>=W)break;
@@ -1246,82 +1575,63 @@ function render(){
           const rF=(AMB_R+WARM_R*L)*fog, gF=(AMB_G+WARM_G*L)*fog, bF=(AMB_B+WARM_B*L)*fog;
           buf[o+xx]=pack(clamp((c&255)*rF,0,255)|0,clamp(((c>>8)&255)*gF,0,255)|0,
                          clamp(((c>>16)&255)*bF,0,255)|0);
+          dbuf[o+xx]=invDist;
         }
       }
-      fx+=stx*4; fy+=sty*4;
+      fx+=stx*4; fy+=sty*4; L0=L1;
     }
   }
 
-  /* ---------------- billboards ---------------- */
-  const invDet=1/(plX*dirY-dirX*plY);
-  const draws=[];
+  /* ---------------- solid things, in three dimensions ---------------- */
   for(const e of enemies){
-    const spr=e.dead?BOT_DEAD:(e.hurtT>0?BOT_HURT:BOT[e.state>=2?2:(e.state===1?1:0)][(e.anim*4|0)&3]);
-    draws.push({x:e.x,y:e.y,z:e.dead?0:0,h:e.dead?.34:.82,w:e.dead?.8:.82,spr:spr,
-                lit:e.dead?.5:1, glowK:e.state>=2?1.25:1});
+    const dx=e.x-pxp, dy=e.y-pyp;
+    if(dx*dx+dy*dy>900)continue;
+    if(e.dead){
+      drawModel(RAT,e.x,e.y,0.0,e.face||0,
+                {gait:0,stride:0,jaw:.3,look:0,burst:0,eyeFlare:.10},
+                1,Math.PI*0.52);
+    }else{
+      drawModel(RAT,e.x,e.y,0.0,e.face||0,e,1,0);
+    }
   }
   for(const L of loots){
     if(L.taken)continue;
-    draws.push({x:L.x,y:L.y,z:.18+Math.sin(time*1.6+L.ph)*.05,h:.42,w:.42,spr:LOOT_SPR,
-                lit:1.5,glowK:1.6+Math.sin(time*3+L.ph)*.4});
+    const bobz=Math.sin(time*1.6+L.ph)*.03;
+    drawModel(RELIC,L.x,L.y,bobz,time*0.6+L.ph,null,1,0);
   }
-  for(const l of LAMPS)
-    draws.push({x:l.x,y:l.y,z:.60,h:.52,w:.52,spr:LAMP_SPR,lit:1.2,glowK:1.45*l.f});
-  for(const p of parts)
-    draws.push({x:p.x,y:p.y,z:p.z,h:.055,w:.055,spr:null,
-                col:p.col?pack(255,190+irnd(60),110):pack(255,210,150),glowK:1});
+  for(const l of LAMPS) drawModel(LAMPMDL,l.x,l.y,0.74,0,null,1,0,null,true);
 
-  for(const s of draws){
-    const sx=s.x-pxp, sy=s.y-pyp;
-    const tX=invDet*(dirY*sx-dirX*sy);
-    const tY=invDet*(-plY*sx+plX*sy);
-    if(tY<.12)continue;
-    s.tY=tY; s.tX=tX;
+  /* ---------------- light that has no surface ---------------- */
+  for(const l of LAMPS)
+    drawGlowSprite(FLAME,l.x,l.y,0.64,1.15,255,196,112,0.62*l.f);
+  for(const L of loots){
+    if(L.taken)continue;
+    drawGlowSprite(GLOW,L.x,L.y,.26+Math.sin(time*1.6+L.ph)*.03,.5,
+                   255,214,140,.30+Math.sin(time*3+L.ph)*.08);
   }
-  draws.sort((a,b)=>(b.tY||0)-(a.tY||0));
-  for(const s of draws){
-    const tY=s.tY; if(!tY||tY<.12)continue;
-    const scrX=(W/2)*(1+s.tX/tY);
-    const yBot=horizon+(eyeZ-s.z)*projD/tY;
-    const yTop=horizon+(eyeZ-s.z-s.h)*projD/tY;
-    const sh=yBot-yTop; if(sh<.6)continue;
-    const sw=sh*(s.w/s.h);
-    const x0=Math.floor(scrX-sw/2), x1=Math.ceil(scrX+sw/2);
-    const fog=1/(1+tY*tY*.030);
-    let L=lightAt(s.x,s.y)*flick+0.44/(1+tY*tY*.55)+muz/(1+tY*tY*.1);
-    L*=s.lit||1;
-    const rF=(AMB_R+WARM_R*L)*fog, gF=(AMB_G+WARM_G*L)*fog, bF=(AMB_B+WARM_B*L)*fog;
-    const gk=(s.glowK||1)*Math.min(1,fog*2.3+.12);
-    const ys=Math.max(0,Math.floor(yTop)), ye=Math.min(H-1,Math.ceil(yBot));
-    if(!s.spr){                                      // particle: flat bright dot
-      const c=s.col;
-      for(let x=Math.max(0,x0);x<=Math.min(W-1,x1);x++){
-        if(zbuf[x]<=tY)continue;
-        for(let y=ys;y<=ye;y++) buf[y*W+x]=c;
-      }
-      continue;
-    }
-    const d=s.spr.d, gl=s.spr.glow, gc=s.spr.gcol;
-    for(let x=Math.max(0,x0);x<=Math.min(W-1,x1);x++){
-      if(zbuf[x]<=tY)continue;
-      const tx=((x-x0)/sw*SS)|0; if(tx<0||tx>=SS)continue;
-      for(let y=ys;y<=ye;y++){
-        const ty=((y-yTop)/sh*SS)|0; if(ty<0||ty>=SS)continue;
-        const i=(ty*SS+tx);
-        const g2=gl[i];
-        if(g2>24){
-          const c=gc[i];
-          const o=y*W+x, old=buf[o];
-          const a=g2/255*gk;
-          buf[o]=pack(clamp((old&255)*(1-a)+(c&255)*a*1.25,0,255)|0,
-                      clamp(((old>>8)&255)*(1-a)+((c>>8)&255)*a*1.25,0,255)|0,
-                      clamp(((old>>16)&255)*(1-a)+((c>>16)&255)*a*1.25,0,255)|0);
-          continue;
-        }
-        const c=d[i];
-        if((c>>>24)<110)continue;
-        buf[y*W+x]=pack(clamp((c&255)*rF,0,255)|0,clamp(((c>>8)&255)*gF,0,255)|0,
-                        clamp(((c>>16)&255)*bF,0,255)|0);
+  for(const e of enemies){
+    const fx=Math.cos(e.face||0), fy=Math.sin(e.face||0);
+    const ex=e.x+fx*.54, ey=e.y+fy*.54, ez=0.262;
+    const dx=pxp-ex, dy=pyp-ey, d=Math.hypot(dx,dy)||1;
+    const facing=clamp((dx/d*fx+dy/d*fy)*1.25+.25,0,1);    // the eye has a beam
+    if(e.dead){ drawGlowSprite(GLOW,ex,ey,0.07,.22,120,30,12,.12); continue; }
+    const k=clamp(e.eyeFlare||1,0,3.4);
+    drawGlowSprite(GLOW,ex,ey,ez,.24+.17*facing+.09*(k-1),255,70,30,
+                   clamp((.15+.32*facing)*(1+(k-1)*.5),0,1.2));
+  }
+  for(const p of parts){
+    const dx=p.x-pxp, dy=p.y-pyp;
+    const f=dx*dirX+dy*dirY; if(f<.2)continue;
+    const r=dx*(-dirY)+dy*dirX;
+    const sxp=(W/2)*(1+r/(FOV_H*f))|0, syp=(horizon-(p.z-eyeZ)*projD/f)|0;
+    const w=1/f, sz=Math.max(1,(0.05*projD/f)|0);
+    const col=p.col?pack(255,205,120):pack(255,236,190);
+    for(let y=syp;y<syp+sz;y++){
+      if(y<0||y>=H)continue;
+      for(let x=sxp;x<sxp+sz;x++){
+        if(x<0||x>=W)continue;
+        const i=y*W+x;
+        if(w>dbuf[i])buf[i]=col;
       }
     }
   }
@@ -1445,7 +1755,7 @@ function updateHud(){
 }
 
 /* ------------------------------ main loop ---------------------------- */
-let last=performance.now(), acc=0;
+let last=performance.now(), acc=0, frameAvg=0.016, frameCount=0;
 function frame(now){
   let dt=(now-last)/1000; last=now;
   if(dt>.05)dt=.05;
@@ -1456,6 +1766,7 @@ function frame(now){
     for(const l of LAMPS) l.f=0.8+0.3*fbm(time*2.2+l.ph,l.x,2)*1.4;
     updatePlayer(dt);
     updateBots(dt);
+    updateListener();
     // particles
     for(let i=parts.length-1;i>=0;i--){
       const p=parts[i];
@@ -1468,6 +1779,13 @@ function frame(now){
     if(hitmarkT>0){ hitmarkT-=dt; if(hitmarkT<=0)hitmarkEl.style.opacity='0'; }
   }
   render();
+  // keep the frame budget: trade resolution for smoothness on slower machines
+  frameAvg=frameAvg*0.92+dt*0.08;
+  if(++frameCount>40){
+    frameCount=0;
+    if(frameAvg>0.021&&RENDER_W>300){ RENDER_W=Math.max(300,(RENDER_W*0.86)|0); resize(); }
+    else if(frameAvg<0.011&&RENDER_W<440){ RENDER_W=Math.min(440,(RENDER_W*1.1)|0); resize(); }
+  }
   updateHud();
   // light gem reads the bake at your feet, plus whether you're moving
   const vis=clamp(lightAt(player.x,player.y)*flick*.72+(player.speed>3?.18:0)
